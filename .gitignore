@@ -1,0 +1,35 @@
+# Build artifacts
+bin/
+obj/
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Rider / VS Code
+.idea/
+.vscode/
+
+# Logs / temp
+*.log
+*.tmp
+
+# Publish outputs
+**/publish/
+**/out/
+
+# Local settings
+*.csproj.user
+*.rsuser
+
+# DB local files (כשנוסיף SQLite)
+app.db
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Secrets (אם יהיו)
+secrets.json

@@ -1,0 +1,6 @@
+@TinyHabits.Api_HostAddress = http://localhost:5285
+
+GET {{TinyHabits.Api_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
