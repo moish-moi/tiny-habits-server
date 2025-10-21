@@ -3,12 +3,49 @@ using TinyHabits.Api.Models;
 using TinyHabits.Api.Services;
 using Microsoft.AspNetCore.Identity;
 using Scalar.AspNetCore;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.IdentityModel.Tokens;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Text;
+
 
 
 var builder = WebApplication.CreateBuilder(args);
 
 // OpenAPI (NET 9)
 builder.Services.AddOpenApi();
+
+
+// === JWT Auth ===
+var jwtCfg = builder.Configuration.GetSection("Jwt");
+var secretKey = jwtCfg["Key"]!;
+var issuer = jwtCfg["Issuer"];
+var audience = jwtCfg["Audience"];
+
+builder.Services.AddAuthentication(o =>
+{
+    o.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+    o.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+})
+.AddJwtBearer(o =>
+{
+    o.RequireHttpsMetadata = false; // DEV בלבד
+    o.TokenValidationParameters = new TokenValidationParameters
+    {
+        ValidateIssuerSigningKey = true,
+        IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey)),
+        ValidateIssuer = true,
+        ValidateAudience = true,
+        ValidIssuer = issuer,
+        ValidAudience = audience,
+        ClockSkew = TimeSpan.Zero
+    };
+});
+
+builder.Services.AddAuthorization();
+
+
 
 // CORS: בשלב לימודי נאפשר הכל (נקשיח בהמשך)
 builder.Services.AddCors(opt =>
@@ -25,6 +62,33 @@ builder.Services.AddSingleton<IPasswordHasher<User>, PasswordHasher<User>>();
 // חדש:
 builder.Services.AddSingleton<InMemoryHabitStore>();
 
+// עזר: יצירת JWT
+string CreateJwt(User user)
+{
+    var jwtCfg = builder.Configuration.GetSection("Jwt");
+    var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtCfg["Key"]!));
+    var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+    var expires = DateTime.UtcNow.AddMinutes(int.Parse(jwtCfg["ExpiresMinutes"]!));
+
+    // סטנדרטי: sub = userId, וגם email
+    var claims = new[]
+    {
+        new Claim(JwtRegisteredClaimNames.Sub, user.Id.ToString()),
+        new Claim(JwtRegisteredClaimNames.Email, user.Email),
+        new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString())
+    };
+
+    var token = new JwtSecurityToken(
+        issuer: jwtCfg["Issuer"],
+        audience: jwtCfg["Audience"],
+        claims: claims,
+        expires: expires,
+        signingCredentials: creds);
+
+    return new JwtSecurityTokenHandler().WriteToken(token);
+}
+
+
 var app = builder.Build();
 
 if (app.Environment.IsDevelopment())
@@ -38,6 +102,9 @@ if (app.Environment.IsDevelopment())
 
 //app.UseHttpsRedirection(); // נכבה זמנית כדי לא לבלבל
 app.UseCors();
+
+app.UseAuthentication();   // ✅ הוסף
+app.UseAuthorization();    // ✅ הוסף
 
 // בדיקת עשן
 app.MapGet("/ping", () => "pong");
@@ -58,9 +125,9 @@ auth.MapPost("/register", (RegisterRequest req, InMemoryUserStore store, IPasswo
     var hash = hasher.HashPassword(tempUser, req.Password);
     var user = store.Add(req.Email, hash);
 
-    // דמו: טוקן פשוט (GUID). נשדרג ל-JWT בהמשך.
-    var token = Convert.ToBase64String(Guid.NewGuid().ToByteArray());
-    return Results.Ok(new AuthResponse(true, "Registered", token));
+    // JWT אמיתי
+var token = CreateJwt(user);
+return Results.Ok(new AuthResponse(true, "Registered", token));
 })
 .WithName("Register")
 .Produces<AuthResponse>(StatusCodes.Status200OK)
@@ -78,7 +145,8 @@ auth.MapPost("/login", (LoginRequest req, InMemoryUserStore store, IPasswordHash
     if (verify == PasswordVerificationResult.Failed)
         return Results.Unauthorized();
 
-    var token = Convert.ToBase64String(Guid.NewGuid().ToByteArray());
+    // JWT אמיתי
+    var token = CreateJwt(user);
     return Results.Ok(new AuthResponse(true, "Logged in", token));
 })
 .WithName("Login")
@@ -100,47 +168,45 @@ app.MapGet("/weatherforecast", () =>
 });
 
 // ====== HABITS GROUP ======
-var habits = app.MapGroup("/api/habits").WithOpenApi();
+var habits = app.MapGroup("/api/habits")
+                .RequireAuthorization()    // כל המסלולים כאן דורשים JWT
+                .WithOpenApi();
 
-// עוזר: לאתר את המשתמש לפי Header פשוט (בשלב In-Memory)
-static int? FindUserIdFromHeader(HttpRequest req, InMemoryUserStore users)
+// עוזר: חילוץ userId מתוך ה-claims של ה-JWT
+static int GetUserIdFromClaims(ClaimsPrincipal user)
 {
-    if (!req.Headers.TryGetValue("X-User-Email", out var email) || string.IsNullOrWhiteSpace(email))
-        return null;
-    var u = users.FindByEmail(email!);
-    return u?.Id;
+    var sub = user.FindFirstValue(JwtRegisteredClaimNames.Sub)
+             ?? user.FindFirstValue(ClaimTypes.NameIdentifier);
+
+    if (string.IsNullOrWhiteSpace(sub)) throw new UnauthorizedAccessException();
+    return int.Parse(sub);
 }
 
-// GET /api/habits  — רשימת הרגלים (Active) + Streak מחושב
-habits.MapGet("/", (HttpRequest req, InMemoryUserStore users, InMemoryHabitStore store) =>
+// GET /api/habits — רשימת הרגלים (Active) + Streak מחושב
+habits.MapGet("/", (HttpContext ctx, InMemoryHabitStore store) =>
 {
-    var userId = FindUserIdFromHeader(req, users);
-    if (userId is null) return Results.Unauthorized();
-
-    var list = store.GetHabits(userId.Value)
+    var userId = GetUserIdFromClaims(ctx.User);
+    var list = store.GetHabits(userId)
                     .Where(h => !h.IsArchived)
                     .Select(h => new HabitResponse(
                         h.Id, h.Title, h.Color, h.IsArchived,
-                        store.GetCurrentStreak(userId.Value, h.Id)
+                        store.GetCurrentStreak(userId, h.Id)
                     ))
                     .ToList();
-
     return Results.Ok(list);
 })
 .WithName("ListHabits")
 .Produces<List<HabitResponse>>(StatusCodes.Status200OK)
 .Produces(StatusCodes.Status401Unauthorized);
 
-// POST /api/habits  — יצירת הרגל חדש
-habits.MapPost("/", (HttpRequest req, HabitCreateRequest body, InMemoryUserStore users, InMemoryHabitStore store) =>
+// POST /api/habits — יצירת הרגל חדש
+habits.MapPost("/", (HttpContext ctx, HabitCreateRequest body, InMemoryHabitStore store) =>
 {
-    var userId = FindUserIdFromHeader(req, users);
-    if (userId is null) return Results.Unauthorized();
-
+    var userId = GetUserIdFromClaims(ctx.User);
     if (string.IsNullOrWhiteSpace(body.Title) || body.Title.Length < 3)
         return Results.BadRequest("Title must be at least 3 chars");
 
-    var h = store.AddHabit(userId.Value, body.Title.Trim(), body.Color);
+    var h = store.AddHabit(userId, body.Title.Trim(), body.Color);
     var res = new HabitResponse(h.Id, h.Title, h.Color, h.IsArchived, 0);
     return Results.Ok(res);
 })
@@ -149,19 +215,17 @@ habits.MapPost("/", (HttpRequest req, HabitCreateRequest body, InMemoryUserStore
 .Produces(StatusCodes.Status400BadRequest)
 .Produces(StatusCodes.Status401Unauthorized);
 
-// POST /api/habits/{id}/checkins  — סימון בוצע לתאריך (ברירת מחדל: היום)
-habits.MapPost("/{id:int}/checkins", (HttpRequest req, int id, CheckinRequest body, InMemoryUserStore users, InMemoryHabitStore store) =>
+// POST /api/habits/{id}/checkins — סימון בוצע לתאריך (ברירת מחדל: היום)
+habits.MapPost("/{id:int}/checkins", (HttpContext ctx, int id, CheckinRequest body, InMemoryHabitStore store) =>
 {
-    var userId = FindUserIdFromHeader(req, users);
-    if (userId is null) return Results.Unauthorized();
-
+    var userId = GetUserIdFromClaims(ctx.User);
     var date = string.IsNullOrWhiteSpace(body.Date)
         ? DateOnly.FromDateTime(DateTime.Today)
         : DateOnly.Parse(body.Date!);
 
     try
     {
-        var ck = store.AddCheckin(userId.Value, id, date);
+        var ck = store.AddCheckin(userId, id, date);
         return Results.Ok(new CheckinResponse(ck.Id, ck.Date.ToString("yyyy-MM-dd")));
     }
     catch (KeyNotFoundException)
@@ -180,19 +244,23 @@ habits.MapPost("/{id:int}/checkins", (HttpRequest req, int id, CheckinRequest bo
 .Produces(StatusCodes.Status409Conflict);
 
 // (רשות) GET /api/habits/{id}/checkins?from=...&to=...
-habits.MapGet("/{id:int}/checkins", (HttpRequest req, int id, string? from, string? to,
-                                     InMemoryUserStore users, InMemoryHabitStore store) =>
+habits.MapGet("/{id:int}/checkins", (HttpContext ctx, int id, string? from, string? to, InMemoryHabitStore store) =>
 {
-    var userId = FindUserIdFromHeader(req, users);
-    if (userId is null) return Results.Unauthorized();
+    var userId = GetUserIdFromClaims(ctx.User);
 
-    var fromDate = string.IsNullOrWhiteSpace(from) ? DateOnly.FromDateTime(DateTime.Today.AddDays(-7)) : DateOnly.Parse(from!);
-    var toDate   = string.IsNullOrWhiteSpace(to)   ? DateOnly.FromDateTime(DateTime.Today)           : DateOnly.Parse(to!);
+    var fromDate = string.IsNullOrWhiteSpace(from)
+        ? DateOnly.FromDateTime(DateTime.Today.AddDays(-7))
+        : DateOnly.Parse(from!);
+
+    var toDate = string.IsNullOrWhiteSpace(to)
+        ? DateOnly.FromDateTime(DateTime.Today)
+        : DateOnly.Parse(to!);
 
     try
     {
-        var days = store.GetCheckinsRange(userId.Value, id, fromDate, toDate)
-                        .Select(d => d.ToString("yyyy-MM-dd"));
+        var days = store.GetCheckinsRange(userId, id, fromDate, toDate)
+                        .Select(d => d.ToString("yyyy-MM-dd"))
+                        .ToList();
         return Results.Ok(days);
     }
     catch (KeyNotFoundException)
@@ -204,5 +272,6 @@ habits.MapGet("/{id:int}/checkins", (HttpRequest req, int id, string? from, stri
 .Produces<List<string>>(StatusCodes.Status200OK)
 .Produces(StatusCodes.Status401Unauthorized)
 .Produces(StatusCodes.Status404NotFound);
+
 
 app.Run();
