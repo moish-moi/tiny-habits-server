@@ -33,3 +33,8 @@ app.db
 
 # Secrets (אם יהיו)
 secrets.json
+
+# Ignore appsettings (local-only)
+appsettings.json
+appsettings.Development.json
+appsettings.*.local.json
