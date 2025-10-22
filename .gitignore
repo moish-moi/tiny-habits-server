@@ -38,3 +38,14 @@ secrets.json
 appsettings.json
 appsettings.Development.json
 appsettings.*.local.json
+
+# SQLite local DB
+Data/*.db
+Data/*.db-shm
+Data/*.db-wal
+
+# Local SQLite databases
+*.db
+*.db-shm
+*.db-wal
+

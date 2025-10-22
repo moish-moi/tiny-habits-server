@@ -1,6 +1,7 @@
 using TinyHabits.Api.Dtos;
 using TinyHabits.Api.Models;
-using TinyHabits.Api.Services;
+using TinyHabits.Api.Data;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.AspNetCore.Identity;
 using Scalar.AspNetCore;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
@@ -16,6 +17,9 @@ var builder = WebApplication.CreateBuilder(args);
 // OpenAPI (NET 9)
 builder.Services.AddOpenApi();
 
+// EF Core + SQLite
+builder.Services.AddDbContext<TinyHabitsDbContext>(opt =>
+    opt.UseSqlite(builder.Configuration.GetConnectionString("Default")));
 
 // === JWT Auth ===
 var jwtCfg = builder.Configuration.GetSection("Jwt");
@@ -57,10 +61,8 @@ builder.Services.AddCors(opt =>
 });
 
 // תלות: מחסן משתמשים בזיכרון + Hash לסיסמאות
-builder.Services.AddSingleton<InMemoryUserStore>();
 builder.Services.AddSingleton<IPasswordHasher<User>, PasswordHasher<User>>();
-// חדש:
-builder.Services.AddSingleton<InMemoryHabitStore>();
+
 
 // עזר: יצירת JWT
 string CreateJwt(User user)
@@ -91,6 +93,14 @@ string CreateJwt(User user)
 
 var app = builder.Build();
 
+// להחיל מיגרציות/ליצור DB אם לא קיים
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<TinyHabitsDbContext>();
+    db.Database.Migrate();
+}
+
+
 if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi(); // /openapi/v1.json
@@ -112,22 +122,27 @@ app.MapGet("/ping", () => "pong");
 // ====== AUTH GROUP ======
 var auth = app.MapGroup("/api/auth").WithOpenApi();
 
+// var logger = app.Logger;
+
+
 // POST /api/auth/register
-auth.MapPost("/register", (RegisterRequest req, InMemoryUserStore store, IPasswordHasher<User> hasher) =>
+auth.MapPost("/register", async (RegisterRequest req, TinyHabitsDbContext db, IPasswordHasher<User> hasher) =>
 {
     if (string.IsNullOrWhiteSpace(req.Email) || string.IsNullOrWhiteSpace(req.Password))
         return Results.BadRequest(new AuthResponse(false, "Email and password are required"));
 
-    if (store.Exists(req.Email))
+    var exists = await db.Users.AnyAsync(u => u.Email == req.Email);
+    if (exists)
         return Results.Conflict(new AuthResponse(false, "Email already registered"));
 
-    var tempUser = new User { Email = req.Email };
-    var hash = hasher.HashPassword(tempUser, req.Password);
-    var user = store.Add(req.Email, hash);
+    var user = new User { Email = req.Email };
+    user.PasswordHash = hasher.HashPassword(user, req.Password);
 
-    // JWT אמיתי
-var token = CreateJwt(user);
-return Results.Ok(new AuthResponse(true, "Registered", token));
+    db.Users.Add(user);
+    await db.SaveChangesAsync(); // כדי לקבל Id
+
+    var token = CreateJwt(user);
+    return Results.Ok(new AuthResponse(true, "Registered", token));
 })
 .WithName("Register")
 .Produces<AuthResponse>(StatusCodes.Status200OK)
@@ -135,9 +150,9 @@ return Results.Ok(new AuthResponse(true, "Registered", token));
 .Produces<AuthResponse>(StatusCodes.Status409Conflict);
 
 // POST /api/auth/login
-auth.MapPost("/login", (LoginRequest req, InMemoryUserStore store, IPasswordHasher<User> hasher) =>
+auth.MapPost("/login", async (LoginRequest req, TinyHabitsDbContext db, IPasswordHasher<User> hasher) =>
 {
-    var user = store.FindByEmail(req.Email);
+    var user = await db.Users.SingleOrDefaultAsync(u => u.Email == req.Email);
     if (user is null)
         return Results.Unauthorized();
 
@@ -145,7 +160,6 @@ auth.MapPost("/login", (LoginRequest req, InMemoryUserStore store, IPasswordHash
     if (verify == PasswordVerificationResult.Failed)
         return Results.Unauthorized();
 
-    // JWT אמיתי
     var token = CreateJwt(user);
     return Results.Ok(new AuthResponse(true, "Logged in", token));
 })
@@ -183,30 +197,71 @@ static int GetUserIdFromClaims(ClaimsPrincipal user)
 }
 
 // GET /api/habits — רשימת הרגלים (Active) + Streak מחושב
-habits.MapGet("/", (HttpContext ctx, InMemoryHabitStore store) =>
+habits.MapGet("/", async (HttpContext ctx, TinyHabitsDbContext db) =>
 {
     var userId = GetUserIdFromClaims(ctx.User);
-    var list = store.GetHabits(userId)
-                    .Where(h => !h.IsArchived)
-                    .Select(h => new HabitResponse(
-                        h.Id, h.Title, h.Color, h.IsArchived,
-                        store.GetCurrentStreak(userId, h.Id)
-                    ))
-                    .ToList();
-    return Results.Ok(list);
+
+    var userHabits = await db.Habits
+        .Where(h => h.UserId == userId && !h.IsArchived)
+        .ToListAsync();
+
+    // חישוב streak פשוט: כמה ימים רצופים אחורה החל מהיום (אם אין צ׳ק־אין היום – streak=0)
+    var today = DateOnly.FromDateTime(DateTime.Today);
+
+    var result = new List<HabitResponse>();
+    foreach (var h in userHabits)
+    {
+        var checkins = await db.Checkins
+            .Where(c => c.HabitId == h.Id && c.Date <= today)
+            .OrderByDescending(c => c.Date)
+            .Select(c => c.Date)
+            .ToListAsync();
+
+        int streak = 0;
+        var expected = today;
+
+        foreach (var d in checkins)
+        {
+            if (d == expected)
+            {
+                streak++;
+                expected = expected.AddDays(-1);
+            }
+            else if (d < expected)
+            {
+                break; // נקטע הרצף
+            }
+        }
+
+        result.Add(new HabitResponse(h.Id, h.Title, h.Color, h.IsArchived, streak));
+    }
+
+    return Results.Ok(result);
 })
 .WithName("ListHabits")
 .Produces<List<HabitResponse>>(StatusCodes.Status200OK)
 .Produces(StatusCodes.Status401Unauthorized);
 
 // POST /api/habits — יצירת הרגל חדש
-habits.MapPost("/", (HttpContext ctx, HabitCreateRequest body, InMemoryHabitStore store) =>
+habits.MapPost("/", async (HttpContext ctx, HabitCreateRequest body, TinyHabitsDbContext db) =>
 {
     var userId = GetUserIdFromClaims(ctx.User);
+
     if (string.IsNullOrWhiteSpace(body.Title) || body.Title.Length < 3)
         return Results.BadRequest("Title must be at least 3 chars");
 
-    var h = store.AddHabit(userId, body.Title.Trim(), body.Color);
+    var h = new Habit
+    {
+        UserId = userId,
+        Title = body.Title.Trim(),
+        Color = body.Color,
+        IsArchived = false,
+        CreatedAtUtc = DateTime.UtcNow
+    };
+
+    db.Habits.Add(h);
+    await db.SaveChangesAsync();
+
     var res = new HabitResponse(h.Id, h.Title, h.Color, h.IsArchived, 0);
     return Results.Ok(res);
 })
@@ -216,26 +271,27 @@ habits.MapPost("/", (HttpContext ctx, HabitCreateRequest body, InMemoryHabitStor
 .Produces(StatusCodes.Status401Unauthorized);
 
 // POST /api/habits/{id}/checkins — סימון בוצע לתאריך (ברירת מחדל: היום)
-habits.MapPost("/{id:int}/checkins", (HttpContext ctx, int id, CheckinRequest body, InMemoryHabitStore store) =>
+habits.MapPost("/{id:int}/checkins", async (HttpContext ctx, int id, CheckinRequest body, TinyHabitsDbContext db) =>
 {
     var userId = GetUserIdFromClaims(ctx.User);
+
+    var habit = await db.Habits.FirstOrDefaultAsync(h => h.Id == id && h.UserId == userId);
+    if (habit is null)
+        return Results.NotFound("Habit not found");
+
     var date = string.IsNullOrWhiteSpace(body.Date)
         ? DateOnly.FromDateTime(DateTime.Today)
         : DateOnly.Parse(body.Date!);
 
-    try
-    {
-        var ck = store.AddCheckin(userId, id, date);
-        return Results.Ok(new CheckinResponse(ck.Id, ck.Date.ToString("yyyy-MM-dd")));
-    }
-    catch (KeyNotFoundException)
-    {
-        return Results.NotFound("Habit not found");
-    }
-    catch (InvalidOperationException)
-    {
+    var exists = await db.Checkins.AnyAsync(c => c.HabitId == id && c.Date == date);
+    if (exists)
         return Results.Conflict("Checkin for that date already exists");
-    }
+
+    var ck = new Checkin { HabitId = id, Date = date };
+    db.Checkins.Add(ck);
+    await db.SaveChangesAsync();
+
+    return Results.Ok(new CheckinResponse(ck.Id, ck.Date.ToString("yyyy-MM-dd")));
 })
 .WithName("AddCheckin")
 .Produces<CheckinResponse>(StatusCodes.Status200OK)
@@ -244,9 +300,13 @@ habits.MapPost("/{id:int}/checkins", (HttpContext ctx, int id, CheckinRequest bo
 .Produces(StatusCodes.Status409Conflict);
 
 // (רשות) GET /api/habits/{id}/checkins?from=...&to=...
-habits.MapGet("/{id:int}/checkins", (HttpContext ctx, int id, string? from, string? to, InMemoryHabitStore store) =>
+habits.MapGet("/{id:int}/checkins", async (HttpContext ctx, int id, string? from, string? to, TinyHabitsDbContext db) =>
 {
     var userId = GetUserIdFromClaims(ctx.User);
+
+    var habit = await db.Habits.FirstOrDefaultAsync(h => h.Id == id && h.UserId == userId);
+    if (habit is null)
+        return Results.NotFound("Habit not found");
 
     var fromDate = string.IsNullOrWhiteSpace(from)
         ? DateOnly.FromDateTime(DateTime.Today.AddDays(-7))
@@ -256,17 +316,13 @@ habits.MapGet("/{id:int}/checkins", (HttpContext ctx, int id, string? from, stri
         ? DateOnly.FromDateTime(DateTime.Today)
         : DateOnly.Parse(to!);
 
-    try
-    {
-        var days = store.GetCheckinsRange(userId, id, fromDate, toDate)
-                        .Select(d => d.ToString("yyyy-MM-dd"))
-                        .ToList();
-        return Results.Ok(days);
-    }
-    catch (KeyNotFoundException)
-    {
-        return Results.NotFound("Habit not found");
-    }
+    var days = await db.Checkins
+        .Where(c => c.HabitId == id && c.Date >= fromDate && c.Date <= toDate)
+        .OrderBy(c => c.Date)
+        .Select(c => c.Date.ToString("yyyy-MM-dd"))
+        .ToListAsync();
+
+    return Results.Ok(days);
 })
 .WithName("GetCheckins")
 .Produces<List<string>>(StatusCodes.Status200OK)
