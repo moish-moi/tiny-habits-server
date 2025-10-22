@@ -196,19 +196,20 @@ static int GetUserIdFromClaims(ClaimsPrincipal user)
     return int.Parse(sub);
 }
 
-// GET /api/habits — רשימת הרגלים (Active) + Streak מחושב
-habits.MapGet("/", async (HttpContext ctx, TinyHabitsDbContext db) =>
+// GET /api/habits?includeArchived=true|false
+habits.MapGet("/", async (HttpContext ctx, TinyHabitsDbContext db, bool? includeArchived) =>
 {
     var userId = GetUserIdFromClaims(ctx.User);
 
-    var userHabits = await db.Habits
-        .Where(h => h.UserId == userId && !h.IsArchived)
-        .ToListAsync();
+    var query = db.Habits.Where(h => h.UserId == userId);
+    if (includeArchived != true)
+        query = query.Where(h => !h.IsArchived);
 
-    // חישוב streak פשוט: כמה ימים רצופים אחורה החל מהיום (אם אין צ׳ק־אין היום – streak=0)
+    var userHabits = await query.ToListAsync();
+
     var today = DateOnly.FromDateTime(DateTime.Today);
-
     var result = new List<HabitResponse>();
+
     foreach (var h in userHabits)
     {
         var checkins = await db.Checkins
@@ -219,18 +220,10 @@ habits.MapGet("/", async (HttpContext ctx, TinyHabitsDbContext db) =>
 
         int streak = 0;
         var expected = today;
-
         foreach (var d in checkins)
         {
-            if (d == expected)
-            {
-                streak++;
-                expected = expected.AddDays(-1);
-            }
-            else if (d < expected)
-            {
-                break; // נקטע הרצף
-            }
+            if (d == expected) { streak++; expected = expected.AddDays(-1); }
+            else if (d < expected) break;
         }
 
         result.Add(new HabitResponse(h.Id, h.Title, h.Color, h.IsArchived, streak));
@@ -241,6 +234,7 @@ habits.MapGet("/", async (HttpContext ctx, TinyHabitsDbContext db) =>
 .WithName("ListHabits")
 .Produces<List<HabitResponse>>(StatusCodes.Status200OK)
 .Produces(StatusCodes.Status401Unauthorized);
+
 
 // POST /api/habits — יצירת הרגל חדש
 habits.MapPost("/", async (HttpContext ctx, HabitCreateRequest body, TinyHabitsDbContext db) =>
@@ -327,6 +321,56 @@ habits.MapGet("/{id:int}/checkins", async (HttpContext ctx, int id, string? from
 .WithName("GetCheckins")
 .Produces<List<string>>(StatusCodes.Status200OK)
 .Produces(StatusCodes.Status401Unauthorized)
+.Produces(StatusCodes.Status404NotFound);
+
+
+// ====== ARCHIVE / UNARCHIVE / DELETE ======
+
+// PUT /api/habits/{id}/archive   — ארכוב הרגל
+habits.MapPut("/{id:int}/archive", async (HttpContext ctx, int id, TinyHabitsDbContext db) =>
+{
+    var userId = GetUserIdFromClaims(ctx.User);
+    var habit = await db.Habits.FirstOrDefaultAsync(h => h.Id == id && h.UserId == userId);
+    if (habit is null) return Results.NotFound("Habit not found");
+
+    if (habit.IsArchived) return Results.NoContent(); // כבר בארכיון
+    habit.IsArchived = true;
+    await db.SaveChangesAsync();
+    return Results.NoContent();
+})
+.WithName("ArchiveHabit")
+.Produces(StatusCodes.Status204NoContent)
+.Produces(StatusCodes.Status404NotFound);
+
+// PUT /api/habits/{id}/unarchive — שחזור הרגל מהארכיון
+habits.MapPut("/{id:int}/unarchive", async (HttpContext ctx, int id, TinyHabitsDbContext db) =>
+{
+    var userId = GetUserIdFromClaims(ctx.User);
+    var habit = await db.Habits.FirstOrDefaultAsync(h => h.Id == id && h.UserId == userId);
+    if (habit is null) return Results.NotFound("Habit not found");
+
+    if (!habit.IsArchived) return Results.NoContent(); // כבר פעיל
+    habit.IsArchived = false;
+    await db.SaveChangesAsync();
+    return Results.NoContent();
+})
+.WithName("UnarchiveHabit")
+.Produces(StatusCodes.Status204NoContent)
+.Produces(StatusCodes.Status404NotFound);
+
+// DELETE /api/habits/{id} — מחיקת הרגל (כולל checkins עקב FK Cascade)
+habits.MapDelete("/{id:int}", async (HttpContext ctx, int id, TinyHabitsDbContext db) =>
+{
+    var userId = GetUserIdFromClaims(ctx.User);
+    var habit = await db.Habits.FirstOrDefaultAsync(h => h.Id == id && h.UserId == userId);
+    if (habit is null) return Results.NotFound("Habit not found");
+
+    db.Habits.Remove(habit);
+    await db.SaveChangesAsync();
+    return Results.NoContent();
+})
+.WithName("DeleteHabit")
+.Produces(StatusCodes.Status204NoContent)
 .Produces(StatusCodes.Status404NotFound);
 
 
